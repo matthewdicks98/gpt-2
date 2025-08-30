@@ -7,6 +7,9 @@ import traceback
 import torch
 import torch.nn as nn
 from torch.nn import functional as f
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
 import time
     
 
@@ -370,17 +373,21 @@ def get_lr(it: int, min_lr: float, max_lr: float, warmup_steps: int, max_steps: 
 
 class DataLoaderLite:
 
-    def __init__(self, batch_size: int, seq_len: int):
+    def __init__(self, batch_size: int, seq_len: int, ddp_world_size: int = 1, ddp_local_rank: int = 0):
         """
         Takes in the batch size and sequence length and loads the data.
 
         :param batch_size: Batch size.
         :param seq_len: Sequence length.
+        :param ddp_world_size: Number of processes running.
+        :param ddp_local_rank: Current process number.
         """
         
         # Set the params.
         self.batch_size = batch_size
         self.seq_len = seq_len
+        self.ddp_world_size = ddp_world_size
+        self.ddp_local_rank = ddp_local_rank
 
         # Load in the text file.
         with open(os.path.join(os.path.dirname(__file__), "input.txt")) as text_file:
@@ -394,11 +401,12 @@ class DataLoaderLite:
         self.tokens = torch.tensor(tokens)
 
         # Set the current position.
-        self.current_pos = 0
+        self.current_pos = batch_size * seq_len * ddp_local_rank
 
         # Print the total tokens and batches per epoch.
-        print(f"Total tokens: {len(tokens)}")
-        print(f"Batches per epoch: {len(tokens) // (batch_size * seq_len)}")
+        if ddp_local_rank == 0:
+            print(f"Total tokens: {len(tokens)}")
+            print(f"Batches per epoch: {len(tokens) // (batch_size * seq_len * ddp_world_size)}")
 
     def next_batch(self):
         """
@@ -408,10 +416,12 @@ class DataLoaderLite:
         """
 
         # Shapes.
-        batch_size, seq_len = self.batch_size, self.seq_len    
+        batch_size, seq_len = self.batch_size, self.seq_len 
+        ddp_local_rank = self.ddp_local_rank
+        ddp_world_size = self.ddp_world_size
 
         # Get next batch.
-        next_pos = self.current_pos + batch_size * seq_len
+        next_pos = self.current_pos + batch_size * seq_len * ddp_world_size
         buf = self.tokens[self.current_pos:next_pos + 1]
         x = buf[:-1].view(batch_size, seq_len)
         y = buf[1:].view(batch_size, seq_len)
@@ -419,21 +429,37 @@ class DataLoaderLite:
         # Compute new pos.
         self.current_pos = next_pos
         if next_pos + 1 > len(self.tokens):
-            self.current_pos = 0
+            self.current_pos = batch_size * seq_len * ddp_local_rank
 
         return x, y
 
 
 if __name__ == "__main__":
 
-    # Auto detect device.
-    print("----- DEVICE CONFIG")
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"Using device: {device}")
+    # If we have multiple GPUs let's run DDP.
+    # DDP will set:
+    #   RANK - Global rank of the process in all processes (for multi-node).
+    #   LOCAL_RANK - Rank of the process in the node.
+    #   WORLD_SIZE - Total number of processes.
+    run_with_ddp = os.environ.get("RANK", -1) != -1
+    if run_with_ddp is True:
+        assert torch.cuda.is_available(), "Need cuda for ddp."
+        init_process_group(backend="nccl")
+        ddp_rank = os.environ["RANK"]
+        ddp_local_rank = os.environ["LOCAL_RANK"]
+        ddp_word_size = os.environ["WORLD_SIZE"]
+        device = f"cuda:{ddp_local_rank}"
+    else:
+        # Set the variables for a non-ddp run.
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_word_size = 1
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    master_process = ddp_local_rank == 0
+    if master_process is True:
+        print("----- DEVICE CONFIG")
+        print(f"Using device: {device}")
 
     torch.manual_seed(1337)
     if torch.cuda.is_available():
@@ -444,16 +470,22 @@ if __name__ == "__main__":
     total_batch_size = 1024 * 4
     batch_size = 2  # Micro batch size.
     seq_len = 1024
-    assert total_batch_size % (batch_size * seq_len) == 0
-    grad_accum_steps = total_batch_size // (batch_size * seq_len)
+    assert total_batch_size % (batch_size * seq_len * ddp_word_size) == 0
+    grad_accum_steps = total_batch_size // (batch_size * seq_len * ddp_word_size)
 
-    print("----- BATCH SIZE CONFIGS")
-    print(f"Total desired batch size: {total_batch_size} tokens")
-    print(f"Micro batch size: {batch_size * seq_len} tokens")
-    print(f"grad_accum_steps: {grad_accum_steps}")
+    if master_process is True:
+        print("----- BATCH SIZE CONFIGS")
+        print(f"Total desired batch size: {total_batch_size} tokens")
+        print(f"Micro batch size: {batch_size * seq_len} tokens")
+        print(f"grad_accum_steps: {grad_accum_steps}")
 
     # Set the data loader.
-    train_loader = DataLoaderLite(batch_size=batch_size, seq_len=seq_len)
+    train_loader = DataLoaderLite(
+        batch_size=batch_size, 
+        seq_len=seq_len, 
+        ddp_world_size=ddp_word_size,
+        ddp_local_rank=ddp_local_rank,
+    )
 
     # Set matmul precision TF32.
     torch.set_float32_matmul_precision("high")
@@ -462,9 +494,15 @@ if __name__ == "__main__":
     model = GPT(GPTConfig(vocab_size=50_304))
     model.to(device)
 
+    # Wrap the model in the DDP container if needed.
+    if run_with_ddp is True:
+        model = DDP(model, device_ids=[ddp_local_rank])
+
+    # Set the model for the optimizer to work on.
+    raw_model = model.module if run_with_ddp is True else model
+
     # Set optimizer.
-    print("----- OPTIMIZER CONFIG")
-    optimizer = model.configure_optimizer(weight_decay=1, learning_rate=3e-4, device=device)
+    optimizer = raw_model.configure_optimizer(weight_decay=1, learning_rate=3e-4, device=device)
 
     # Set lr schedule.
     max_lr = 6e-4
@@ -472,14 +510,14 @@ if __name__ == "__main__":
     warmup_steps = 10
     max_steps = 50
 
-    print("----- STEPPING")
-
     t = time.time()
     lrs = []
     for step in range(max_steps):
 
         t0 = time.time()
-        optimizer.zero_grad()  # Set gradients to 0.
+
+        # Set gradients to 0.
+        optimizer.zero_grad()
 
         # Perform gradient accumulation.
         # This is to simulate a larger batch-size than the gpus we have.
@@ -490,28 +528,46 @@ if __name__ == "__main__":
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
 
-            # Accumulate the grads for this batch.
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                logits, loss = model(x, y)  # Forward through the model.
-            
-            loss /= grad_accum_steps  # Make sure the normalizer for cross-entropy is correct.
-            loss_accum += loss.detach()
-            loss.backward()  # Accum grads.
+            if run_with_ddp is True:
+                # If True then we need to sync grad across processes. 
+                # If False then we just accumulate per process grads.
+                # Avoids expensive all reduce on every grad accum step.
+                model.require_backward_grad_sync = grad_accum_step == grad_accum_steps - 1
 
+            # Forward through the model and calculate the loss.
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)  
+            
+            # Make sure the normalizer for cross-entropy is correct.
+            loss /= grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
+            
+        # Compute the average loss for all processes.
+        if run_with_ddp and master_process:
+            loss_accum = dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        
         # Perform the grad update.
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(it=step, max_lr=max_lr, min_lr=min_lr, max_steps=max_steps, warmup_steps=warmup_steps)
         lrs.append(lr)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        optimizer.step()  # Optimized step.
+        optimizer.step()
 
-        torch.cuda.synchronize()  # Make sure all gpu kernels have completed.
+        # Make sure all gpu kernels have completed.
+        torch.cuda.synchronize()
         t1 = time.time()
         dt = (t1 - t0)*1000
-        tokens_per_sec = (train_loader.batch_size * train_loader.seq_len * grad_accum_steps) / (t1 - t0)
+        tokens_processed = train_loader.batch_size * train_loader.seq_len * grad_accum_steps * ddp_word_size
+        tokens_per_sec = tokens_processed / (t1 - t0)
 
-        print(f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        if master_process is True:
+            print(f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
-    print(f"total_time: {time.time() - t:.4f}s")
-    print("loss", loss)
+    if run_with_ddp is True:
+        destroy_process_group()
+
+    if master_process is True:
+        print(f"total_time: {time.time() - t:.4f}s")
+        print("loss", loss)
