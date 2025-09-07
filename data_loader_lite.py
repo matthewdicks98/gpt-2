@@ -102,6 +102,6 @@ class DataLoaderLite:
         :param shard: Index of the shard we want to load.
         :return: The tokens for the shard.
         """
-        tokens = np.load(os.path.join(self.data_dir, f"shard_{self.split}_{shard}.npy"))
+        tokens = np.load(os.path.join(self.data_dir, shard))
         tokens = torch.from_numpy(tokens).to(dtype=torch.long)
         return tokens
