@@ -11,18 +11,21 @@ ENCODER = tiktoken.get_encoding("gpt2")
 EOT = ENCODER._special_tokens["<|endoftext|>"]
 
 
-def tokenize_fineweb():
+def tokenize_fineweb(sample: str):
     """
     Download the fineweb-edu dataset and tokenize.
 
     ETA on this should be around 30 min for sample-10BT.
+
+    :param sample: what sample from fineweb we want to download and tokenize.
     """
     
     # Download the Fineweb-edu dataset.
-    fineweb = load_dataset("HuggingFaceFW/fineweb-edu", name="CC-MAIN-2013-20", split="train")
+    fineweb = load_dataset("HuggingFaceFW/fineweb-edu", name=sample, split="train")
 
     # Create the directory to save the data to.
-    data_dir = os.path.join(os.path.expanduser("~"), ".fineweb")
+    project_dir = os.environ.get("PROJECT_DIR", os.path.expanduser("~"))
+    data_dir = os.path.join(project_dir, ".fineweb")
     os.makedirs(data_dir, exist_ok=True)
 
     total_tokens = 0
@@ -30,56 +33,66 @@ def tokenize_fineweb():
     # Tokenize the fineweb dataset into shards of uint16s.
     max_shard_size = int(1e8)
     n_processes = max(1, os.cpu_count() // 2)
-    with (
-        mp.Pool(processes=n_processes) as pool,
-        tqdm(total=max_shard_size, ncols=80) as pbar,
-    ):
+    with mp.Pool(processes=n_processes, maxtasksperchild=1_000_000) as pool:
+
+        progress_bar = None
 
         # Create the token shards.
         shard_index = 0
-        n_tokens = 0
-        shard_tokens = []
-        for tokens in pool.imap(tokenize_doc, fineweb, chunksize=16):
+        all_tokens_np = np.empty((max_shard_size,), dtype=np.uint16)
+        token_count = 0        
+
+        for tokens in pool.imap_unordered(tokenize_doc, fineweb, chunksize=16):
+
+            if token_count + len(tokens) < max_shard_size:
+
+                # Simply append tokens to current shard.
+                all_tokens_np[token_count:token_count+len(tokens)] = tokens
+                token_count += len(tokens)
+
+                if progress_bar is None:
+                    progress_bar = tqdm(
+                        total=max_shard_size, 
+                        unit="tokens", 
+                        desc=f"Shard {shard_index}"
+                    )
+                progress_bar.update(len(tokens))
             
-            n_tokens += tokens.shape[0]
-            total_tokens += tokens.shape[0]
-            if n_tokens < max_shard_size:
-
-                # Add to the current shard tokens.
-                shard_tokens.append(tokens)
-
-                # Update the progress bar.
-                pbar.update(shard_tokens_np.shape[0])
-                pbar.set_description(f"shard_{shard_index}")
-
             else:
 
                 # Set the split.
                 split = "train" if shard_index != 0 else "val"
 
+                remainder = max_shard_size - token_count
+                all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+
                 # Save the previous shards tokens.
-                shard_tokens_np = np.vstack(shard_tokens)
                 np.save(
                     file=os.path.join(data_dir, f"shard_{split}_{shard_index}.npy"),
-                    arr=shard_tokens_np
+                    arr=all_tokens_np
                 )
 
                 # Clear the buffers and set a new shard.
                 shard_index += 1
-                shard_tokens = []
-                n_tokens = 0
+                all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
+                token_count = len(tokens)-remainder
 
                 # Empty the progress bar.
-                pbar.n = 0
-                pbar.set_description(f"shard_{shard_index}")
+                progress_bar.update(remainder)
+                progress_bar = None
+
+                total_tokens += all_tokens_np.shape[0]
 
         # Save the overflow.
-        if len(shard_tokens) > 0:
-            shard_tokens_np = np.vstack(shard_tokens)
+        if token_count != 0:
+
+            split = "val" if shard_index == 0 else "train"
             np.save(
                 file=os.path.join(data_dir, f"shard_{shard_index}.npy"),
-                arr=shard_tokens_np
+                arr=all_tokens_np[:token_count]
             )
+
+            total_tokens += all_tokens_np.shape[0]
 
     print(f"Total tokens - {total_tokens}")
 
@@ -100,4 +113,4 @@ def tokenize_doc(doc: dict):
 
 
 if __name__ == "__main__":
-    tokenize_fineweb()
+    tokenize_fineweb(sample="CC-MAIN-2013-20")
