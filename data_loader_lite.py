@@ -8,8 +8,8 @@ class DataLoaderLite:
             self, 
             batch_size: int, 
             seq_len: int, 
-            process_num: int = 1, 
-            num_processes: int = 0,
+            process_num: int = 0, 
+            num_processes: int = 1,
             split: str = "train"
         ):
         """
@@ -25,6 +25,7 @@ class DataLoaderLite:
         # Set the params.
         self.batch_size = batch_size
         self.seq_len = seq_len
+        self.n_batch_tokens = batch_size * seq_len
         self.process_num = process_num
         self.num_processes = num_processes
 
@@ -38,10 +39,11 @@ class DataLoaderLite:
         # Get the split and shards this process is responsible for.
         self.shards = sorted(os.listdir(self.data_dir))
         self.shards = [s for s in self.shards if split in s]
-        self.shards = [s for six, s in enumerate(self.shards) if six % process_num == num_processes]
 
         # Set the current token buffer.
         self.tokens = None
+        self.current_shard = 0
+        self.current_pos = 0
 
         # Set everything to the beginning.
         self.reset()
@@ -56,7 +58,7 @@ class DataLoaderLite:
         Reset the dataloader back to the beginning.
         """
         self.current_shard = 0
-        self.current_pos = 0
+        self.current_pos = self.process_num * self.n_batch_tokens
         self.tokens = self.load_tokens(shard=self.shards[self.current_shard])
 
     def next_batch(self):
@@ -71,25 +73,25 @@ class DataLoaderLite:
         """
 
         # Shapes.
-        batch_size, seq_len = self.batch_size, self.seq_len 
+        batch_size, seq_len, n_batch_tokens = self.batch_size, self.seq_len, self.n_batch_tokens 
 
         # Get next batch.
-        buf = self.tokens[self.current_pos:self.current_pos + batch_size * seq_len + 1]
+        buf = self.tokens[self.current_pos:self.current_pos + n_batch_tokens + 1]
         x = buf[:-1].view(batch_size, seq_len)
         y = buf[1:].view(batch_size, seq_len)
 
         # Compute new pos.
-        self.current_pos += batch_size * seq_len
+        self.current_pos += self.n_batch_tokens * self.num_processes
 
         # Check if there are enough tokens to fit.
-        if self.current_pos + batch_size * seq_len + 1 > len(self.tokens):
+        if self.current_pos + self.n_batch_tokens + 1 > len(self.tokens):
 
             # Get the current shard with wrap around and load.
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = self.load_tokens(shard=self.shards[self.current_shard])
 
             # Init back to the start.
-            self.current_pos = 0
+            self.current_pos = self.process_num * n_batch_tokens
 
         return x, y
     
