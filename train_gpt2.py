@@ -13,6 +13,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import time
 import numpy as np
 from data_loader_lite import DataLoaderLite
+from hellaswag import iterate_examples, render_example
     
 
 # ==================================================================
@@ -366,7 +367,112 @@ def get_lr(it: int, min_lr: float, max_lr: float, warmup_steps: int, max_steps: 
     assert 0 <= decay_ratio <= 1
     coef = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coef * (max_lr - min_lr)
+
+
+# ================================================================================
+# EVALS
+# ================================================================================
+
+ENCODER = tiktoken.get_encoding("gpt2")
+EOT = ENCODER._special_tokens["<|endoftext|>"]
+
+def generate(model: GPT, prompt: str, num_generations: int, max_tokens: int, device: str):
+    """
+    Sample from the given model.
+    """
+
+    # --- Step _: Tokenize the prompt. ---
+
+    prompt_tokens = ENCODER.encode_ordinary(text=prompt)
+    prompt_tokens_np = np.array(prompt_tokens)
+
+    assert prompt_tokens_np.shape[0] <= GPTConfig.block_size, f"Max seq len is {GPTConfig.block_size}"
+    prompt_tokens_t = torch.from_numpy(prompt_tokens_np).to(dtype=torch.long, device=device)
+    prompt_tokens_t = prompt_tokens_t.repeat(repeats=(num_generations, 1))
+
+    # --- Step _: Forward through the model to get logits. ---
     
+    sample_rng = torch.Generator(device=device)
+    sample_rng.manual_seed(42 + ddp_rank)
+
+    model.eval()
+    with torch.no_grad():
+
+        while prompt_tokens_t.shape[-1] < max_tokens:
+
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, _ = model(prompt_tokens_t)  
+
+            # Sample from the model using top k sampling.
+            logits = logits[:, -1, :]
+            probs = f.softmax(logits, dim=1)
+            topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
+            topk_samples = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng)
+            samples = torch.gather(input=topk_indices, dim=-1, index=topk_samples)
+
+            # Concat the new tokens to the old tokens.
+            prompt_tokens_t = torch.concat((prompt_tokens_t, samples), dim=-1)
+
+    # Decode the tokens back to text so we can print.
+    generations = []
+    for i in range(prompt_tokens_t.shape[0]):
+        decoded_seq = ENCODER.decode(tokens=prompt_tokens_t[i, :].tolist())
+        generations.append(decoded_seq)
+
+    return generations
+
+
+def get_most_likely_row(model: GPT, tokens: torch.tensor, mask: torch.tensor):
+    """
+    This helps in evaluating HellaSwag.
+
+    For the given tokens and the mask pick the row that is most likely.
+    """
+    model.eval()
+    with torch.no_grad():
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, _ = model(tokens)  
+
+        # Shift the logits and tokens so we can compute the loss.
+        # Makes sure we use the tokens as the labels.
+        shifted_logits = logits[:, :-1, :].contiguous()
+        shifted_tokens = tokens[:, 1:].contiguous()
+        shifted_mask = mask[:, 1:].contiguous()
+
+        # Compute the loss at each token.
+        flat_logits = shifted_logits.view(-1, logits.shape[-1])
+        flat_tokens = shifted_tokens.view(-1)
+        loss = f.cross_entropy(flat_logits, flat_tokens, reduction="none")
+
+        # For each option compute the average loss.
+        loss = loss.view(-1, shifted_mask.shape[-1])
+        loss = loss * shifted_mask
+        loss_avg = loss.sum(dim=1) / shifted_mask.sum(dim=1)
+
+        # Pick the option with the lowest loss.
+        best_option = loss_avg.argmin().item()
+        return best_option
+
+
+def get_most_likely_row_karp(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = f.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
 
 if __name__ == "__main__":
 
@@ -417,8 +523,16 @@ if __name__ == "__main__":
     train_loader = DataLoaderLite(
         batch_size=batch_size, 
         seq_len=seq_len, 
-        ddp_world_size=ddp_word_size,
-        ddp_local_rank=ddp_local_rank,
+        process_num=0,
+        num_processes=1,
+        split="train"
+    )
+    val_loader = DataLoaderLite(
+        batch_size=batch_size, 
+        seq_len=seq_len, 
+        process_num=0,
+        num_processes=1,
+        split="val"
     )
 
     # Set matmul precision TF32.
@@ -444,16 +558,94 @@ if __name__ == "__main__":
     warmup_steps = 10
     max_steps = 50
 
+    # Set the eval params.
+    eval_freq = 250
+    val_loss_steps = 20
+
     t = time.time()
     lrs = []
     for step in range(max_steps):
 
         t0 = time.time()
 
-        # Set gradients to 0.
-        optimizer.zero_grad()
+        # --- Step _: Compute the validation loss. ---
 
-        # Perform gradient accumulation.
+        if step % eval_freq == 0 or step == max_steps - 1:
+
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                
+                val_loss_accum = 0.0
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device=device), y.to(device=device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)  
+
+                    # Scale and accumulate loss.
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+
+                if run_with_ddp is True:
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+
+        # --- Step _: Generate some samples. ---
+
+        if step % eval_freq == 0 or step == max_steps - 1:
+
+            generations = generate(
+                model=model, 
+                prompt="Hello, I'm a language model,", 
+                max_tokens=50, 
+                num_generations=5,
+                device=device
+            )
+            for gix, generation in enumerate(generations):
+                print("---")
+                print(f"{gix + 1} - {generation}")
+                print("---")
+
+        # --- Step _: Eval on HellaSwag. ---
+
+        if step % eval_freq == 0 or step == max_steps - 1:
+            
+            n_examples = 0
+            n_correct = 0
+            for hix, example in enumerate(iterate_examples(split="val")):
+                
+                if hix % ddp_word_size == ddp_local_rank:
+
+                    # Split HellaSwag over processes.
+                    # For this example predict which option is best.
+                    data, tokens, mask, label = render_example(example=example)
+                    tokens, mask = tokens.to(device=device), mask.to(device=device)
+                    my_pred = get_most_likely_row(model=model, tokens=tokens, mask=mask)
+
+                    n_examples += 1
+                    n_correct += int(my_pred == label)
+            
+            if run_with_ddp is True:
+
+                # Aggregate over processes.
+                n_examples_t = torch.tensor(n_examples, device=device)
+                n_correct_t = torch.tensor(n_correct, device=device)
+                dist.all_reduce(n_examples_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(n_correct_t, op=dist.ReduceOp.SUM)
+                n_examples = n_examples_t.item()
+                n_correct = n_correct_t.item()
+
+            # Compute the accuracy.
+            hella_acc = n_correct / n_examples
+
+        # --- Step _: TODO: Checkpoint the model. ---
+
+        # --- Step _: Optimize the network. ---
+
+        # Init the training.
+        model.train()
+        optimizer.zero_grad()
+        
         # This is to simulate a larger batch-size than the gpus we have.
         loss_accum = 0.0
         for grad_accum_step in range(grad_accum_steps):
@@ -479,7 +671,7 @@ if __name__ == "__main__":
             
         # Compute the average loss for all processes.
         if run_with_ddp and master_process:
-            loss_accum = dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            loss_accum = dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)        
         
         # Perform the grad update.
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -488,6 +680,8 @@ if __name__ == "__main__":
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         optimizer.step()
+
+        # --- Step _: Log details. ---
 
         # Make sure all gpu kernels have completed.
         torch.cuda.synchronize()
@@ -499,6 +693,8 @@ if __name__ == "__main__":
         if master_process is True:
             print(f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
+        # ----------------------------
+
     if run_with_ddp is True:
         destroy_process_group()
 
