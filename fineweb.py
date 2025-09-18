@@ -113,4 +113,4 @@ def tokenize_doc(doc: dict):
 
 
 if __name__ == "__main__":
-    tokenize_fineweb(sample="CC-MAIN-2013-20")
+    tokenize_fineweb(sample="sample-10BT")
