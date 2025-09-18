@@ -556,11 +556,15 @@ if __name__ == "__main__":
     max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 10
-    max_steps = 50
+    max_steps = 100
 
     # Set the eval params.
     eval_freq = 250
     val_loss_steps = 20
+
+    # Create the logs and clear.
+    log_dir = os.path.join(os.environ.get("PROJECT_DIR", os.path.expanduser("~")), "gpt2", "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
     t = time.time()
     lrs = []
@@ -568,9 +572,15 @@ if __name__ == "__main__":
 
         t0 = time.time()
 
-        # --- Step _: Compute the validation loss. ---
+        # Variables to use for logging.
+        val_loss = None
+        hella_acc = None
+        generations = None
+        time_to_eval = step % eval_freq == 0 or step == max_steps - 1
 
-        if step % eval_freq == 0 or step == max_steps - 1:
+        if time_to_eval:
+
+            # --- Step _: Compute the validation loss. ---
 
             model.eval()
             val_loader.reset()
@@ -590,9 +600,9 @@ if __name__ == "__main__":
                 if run_with_ddp is True:
                     dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
 
-        # --- Step _: Generate some samples. ---
+            val_loss = val_loss_accum.item()
 
-        if step % eval_freq == 0 or step == max_steps - 1:
+            # --- Step _: Generate some samples. ---
 
             generations = generate(
                 model=model, 
@@ -601,42 +611,36 @@ if __name__ == "__main__":
                 num_generations=5,
                 device=device
             )
-            for gix, generation in enumerate(generations):
-                print("---")
-                print(f"{gix + 1} - {generation}")
-                print("---")
 
-        # --- Step _: Eval on HellaSwag. ---
-
-        if step % eval_freq == 0 or step == max_steps - 1:
+            # --- Step _: Eval on HellaSwag. ---
             
-            n_examples = 0
-            n_correct = 0
-            for hix, example in enumerate(iterate_examples(split="val")):
+            # n_examples = 0
+            # n_correct = 0
+            # for hix, example in enumerate(iterate_examples(split="val")):
                 
-                if hix % ddp_word_size == ddp_local_rank:
+            #     if hix % ddp_word_size == ddp_local_rank:
 
-                    # Split HellaSwag over processes.
-                    # For this example predict which option is best.
-                    data, tokens, mask, label = render_example(example=example)
-                    tokens, mask = tokens.to(device=device), mask.to(device=device)
-                    my_pred = get_most_likely_row(model=model, tokens=tokens, mask=mask)
+            #         # Split HellaSwag over processes.
+            #         # For this example predict which option is best.
+            #         data, tokens, mask, label = render_example(example=example)
+            #         tokens, mask = tokens.to(device=device), mask.to(device=device)
+            #         my_pred = get_most_likely_row(model=model, tokens=tokens, mask=mask)
 
-                    n_examples += 1
-                    n_correct += int(my_pred == label)
+            #         n_examples += 1
+            #         n_correct += int(my_pred == label)
             
-            if run_with_ddp is True:
+            # if run_with_ddp is True:
 
-                # Aggregate over processes.
-                n_examples_t = torch.tensor(n_examples, device=device)
-                n_correct_t = torch.tensor(n_correct, device=device)
-                dist.all_reduce(n_examples_t, op=dist.ReduceOp.SUM)
-                dist.all_reduce(n_correct_t, op=dist.ReduceOp.SUM)
-                n_examples = n_examples_t.item()
-                n_correct = n_correct_t.item()
+            #     # Aggregate over processes.
+            #     n_examples_t = torch.tensor(n_examples, device=device)
+            #     n_correct_t = torch.tensor(n_correct, device=device)
+            #     dist.all_reduce(n_examples_t, op=dist.ReduceOp.SUM)
+            #     dist.all_reduce(n_correct_t, op=dist.ReduceOp.SUM)
+            #     n_examples = n_examples_t.item()
+            #     n_correct = n_correct_t.item()
 
-            # Compute the accuracy.
-            hella_acc = n_correct / n_examples
+            # # Compute the accuracy.
+            # hella_acc = n_correct / n_examples
 
         # --- Step _: TODO: Checkpoint the model. ---
 
@@ -670,7 +674,7 @@ if __name__ == "__main__":
             loss.backward()
             
         # Compute the average loss for all processes.
-        if run_with_ddp and master_process:
+        if run_with_ddp is True:
             loss_accum = dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)        
         
         # Perform the grad update.
@@ -691,7 +695,37 @@ if __name__ == "__main__":
         tokens_per_sec = tokens_processed / (t1 - t0)
 
         if master_process is True:
-            print(f"step: {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            print(
+                f"step: {step} | "
+                f"loss: {loss_accum.item():.6f} | "
+                f"lr: {lr:.4e} | "
+                f"norm: {norm:.4f} | "
+                f"dt: {dt:.2f}ms | "
+                f"tok/sec: {tokens_per_sec:.2f}"
+            )
+
+            mode = "w" if step == 0 else "a"
+
+            # Log the losses to a file.
+            with open(os.path.join(log_dir, "losses.log"), mode) as f_losses:
+                f_losses.write(f"{loss_accum.item()},{val_loss}\n")
+            
+            # Log the HellaSwag evals.
+            with open(os.path.join(log_dir, "hellaswag.log"), mode) as f_hella:
+                f_hella.write(f"{hella_acc}\n")
+
+            # Log the generations.
+            if isinstance(generations, list) and len(generations) > 0:
+                generations_str = "\n".join(generations)
+                with open(os.path.join(log_dir, "generations.log"), mode, encoding="utf-8") as f_gen:
+                    f_gen.write("=" * 40)
+                    f_gen.write("\n")
+                    f_gen.write(f"Step - {step}")
+                    f_gen.write("\n")
+                    f_gen.write(generations_str)
+                    f_gen.write("\n")
+                    f_gen.write("=" * 40)
+                    f_gen.write("\n")
     
         # ----------------------------
 
