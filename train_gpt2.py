@@ -507,8 +507,8 @@ if __name__ == "__main__":
 
     # Configure batch-sizings.
     # gpt-2 124M was 524_288.
-    total_batch_size = 1024 * 4
-    batch_size = 2  # Micro batch size.
+    total_batch_size = 524_288  # 1024 * 4
+    batch_size = 524_288  # 2  # Micro batch size.
     seq_len = 1024
     assert total_batch_size % (batch_size * seq_len * ddp_word_size) == 0
     grad_accum_steps = total_batch_size // (batch_size * seq_len * ddp_word_size)
@@ -523,15 +523,15 @@ if __name__ == "__main__":
     train_loader = DataLoaderLite(
         batch_size=batch_size, 
         seq_len=seq_len, 
-        process_num=0,
-        num_processes=1,
+        process_num=ddp_rank,
+        num_processes=ddp_word_size,
         split="train"
     )
     val_loader = DataLoaderLite(
         batch_size=batch_size, 
         seq_len=seq_len, 
-        process_num=0,
-        num_processes=1,
+        process_num=ddp_rank,
+        num_processes=ddp_word_size,
         split="val"
     )
 
@@ -555,11 +555,11 @@ if __name__ == "__main__":
     # Set lr schedule.
     max_lr = 6e-4
     min_lr = max_lr * 0.1
-    warmup_steps = 10
-    max_steps = 100
+    warmup_steps = 715  # 10
+    max_steps = 19073  # 100 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
     # Set the eval params.
-    eval_freq = 250
+    eval_freq = 30
     val_loss_steps = 20
 
     # Create the logs and clear.
@@ -614,33 +614,33 @@ if __name__ == "__main__":
 
             # --- Step _: Eval on HellaSwag. ---
             
-            # n_examples = 0
-            # n_correct = 0
-            # for hix, example in enumerate(iterate_examples(split="val")):
+            n_examples = 0
+            n_correct = 0
+            for hix, example in enumerate(iterate_examples(split="val")):
                 
-            #     if hix % ddp_word_size == ddp_local_rank:
+                if hix % ddp_word_size == ddp_local_rank:
 
-            #         # Split HellaSwag over processes.
-            #         # For this example predict which option is best.
-            #         data, tokens, mask, label = render_example(example=example)
-            #         tokens, mask = tokens.to(device=device), mask.to(device=device)
-            #         my_pred = get_most_likely_row(model=model, tokens=tokens, mask=mask)
+                    # Split HellaSwag over processes.
+                    # For this example predict which option is best.
+                    data, tokens, mask, label = render_example(example=example)
+                    tokens, mask = tokens.to(device=device), mask.to(device=device)
+                    my_pred = get_most_likely_row(model=model, tokens=tokens, mask=mask)
 
-            #         n_examples += 1
-            #         n_correct += int(my_pred == label)
+                    n_examples += 1
+                    n_correct += int(my_pred == label)
             
-            # if run_with_ddp is True:
+            if run_with_ddp is True:
 
-            #     # Aggregate over processes.
-            #     n_examples_t = torch.tensor(n_examples, device=device)
-            #     n_correct_t = torch.tensor(n_correct, device=device)
-            #     dist.all_reduce(n_examples_t, op=dist.ReduceOp.SUM)
-            #     dist.all_reduce(n_correct_t, op=dist.ReduceOp.SUM)
-            #     n_examples = n_examples_t.item()
-            #     n_correct = n_correct_t.item()
+                # Aggregate over processes.
+                n_examples_t = torch.tensor(n_examples, device=device)
+                n_correct_t = torch.tensor(n_correct, device=device)
+                dist.all_reduce(n_examples_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(n_correct_t, op=dist.ReduceOp.SUM)
+                n_examples = n_examples_t.item()
+                n_correct = n_correct_t.item()
 
-            # # Compute the accuracy.
-            # hella_acc = n_correct / n_examples
+            # Compute the accuracy.
+            hella_acc = n_correct / n_examples
 
         # --- Step _: TODO: Checkpoint the model. ---
 
