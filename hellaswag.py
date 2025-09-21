@@ -38,6 +38,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
 
+os.environ["PROJECT_DIR"] = os.path.join(os.path.expanduser("~"), "workspace")
+
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.environ.get("PROJECT_DIR", os.path.expanduser("~")), "hellaswag")
 

@@ -6,6 +6,9 @@ import os
 from tqdm import tqdm
 
 
+os.environ["PROJECT_DIR"] = os.path.join(os.path.expanduser("~"), "workspace")
+
+
 # Init the tokenizer.
 ENCODER = tiktoken.get_encoding("gpt2")
 EOT = ENCODER._special_tokens["<|endoftext|>"]

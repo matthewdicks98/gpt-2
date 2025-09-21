@@ -14,6 +14,9 @@ import time
 import numpy as np
 from data_loader_lite import DataLoaderLite
 from hellaswag import iterate_examples, render_example
+
+
+os.environ["PROJECT_DIR"] = os.path.join(os.path.expanduser("~"), "workspace")
     
 
 # ==================================================================
