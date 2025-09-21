@@ -517,7 +517,7 @@ if __name__ == "__main__":
     # Configure batch-sizings.
     # gpt-2 124M was 524_288.
     total_batch_size = 524_288  # 1024 * 4
-    batch_size = 524_288  # 2  # Micro batch size.
+    batch_size = 64  # 2  # Micro batch size.
     seq_len = 1024
     assert total_batch_size % (batch_size * seq_len * ddp_word_size) == 0
     grad_accum_steps = total_batch_size // (batch_size * seq_len * ddp_word_size)
