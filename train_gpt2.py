@@ -393,6 +393,8 @@ def generate(model: GPT, prompt: str, num_generations: int, max_tokens: int, dev
     prompt_tokens_t = torch.from_numpy(prompt_tokens_np).to(dtype=torch.long, device=device)
     prompt_tokens_t = prompt_tokens_t.repeat(repeats=(num_generations, 1))
 
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+
     # --- Step _: Forward through the model to get logits. ---
     
     sample_rng = torch.Generator(device=device)
@@ -403,7 +405,7 @@ def generate(model: GPT, prompt: str, num_generations: int, max_tokens: int, dev
 
         while prompt_tokens_t.shape[-1] < max_tokens:
 
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits, _ = model(prompt_tokens_t)  
 
             # Sample from the model using top k sampling.
@@ -431,9 +433,11 @@ def get_most_likely_row(model: GPT, tokens: torch.tensor, mask: torch.tensor):
 
     For the given tokens and the mask pick the row that is most likely.
     """
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+
     model.eval()
     with torch.no_grad():
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, _ = model(tokens)  
 
         # Shift the logits and tokens so we can compute the loss.
@@ -498,6 +502,8 @@ if __name__ == "__main__":
         ddp_local_rank = 0
         ddp_word_size = 1
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
 
     master_process = ddp_local_rank == 0
     if master_process is True:
@@ -593,7 +599,7 @@ if __name__ == "__main__":
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device=device), y.to(device=device)
-                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                         logits, loss = model(x, y)  
 
                     # Scale and accumulate loss.
@@ -668,7 +674,7 @@ if __name__ == "__main__":
                 model.require_backward_grad_sync = grad_accum_step == grad_accum_steps - 1
 
             # Forward through the model and calculate the loss.
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits, loss = model(x, y)  
             
             # Make sure the normalizer for cross-entropy is correct.
