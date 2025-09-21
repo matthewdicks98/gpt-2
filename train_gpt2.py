@@ -651,7 +651,7 @@ if __name__ == "__main__":
             # Compute the accuracy.
             hella_acc = n_correct / n_examples
 
-        # --- Step _: TODO: Checkpoint the model. ---
+        # --- Step _: Checkpoint the model. ---
 
         if step > 0 and (step % 10_000 == 0 or step == max_steps - 1):
             # optionally write model checkpoints
